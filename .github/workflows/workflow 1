@@ -1,0 +1,58 @@
+name: Passive Site Builder
+
+# 🔄 Run every day at 9 AM UTC + manual trigger
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 9 * * *'
+
+jobs:
+  build-and-deploy:
+    name: Build & Deploy Site
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # 1️⃣ Get your repo code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2️⃣ Set up Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 3️⃣ Install dependencies
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 4️⃣ Run the site generator
+      - name: Generate content
+        run: |
+          echo "🏗️ Starting site generation..."
+          python auto_passive_site.py > build_log.txt 2>&1
+          echo "✅ Site generation completed."
+
+      # 5️⃣ Show short build summary in the GitHub Action logs
+      - name: Show build log summary
+        run: |
+          echo "🚀 Build Summary:"
+          tail -n 15 build_log.txt || true
+
+      # 6️⃣ Deploy to GitHub Pages
+      - name: Deploy site to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./output_site
+
+      # 7️⃣ Upload full build logs (for reference)
+      - name: Upload build log
+        uses: actions/upload-artifact@v4
+        with:
+          name: build_log
+          path: build_log.txt
