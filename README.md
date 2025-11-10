@@ -2,9 +2,6 @@
 Welcome!
 View my latest reviews below. 
 ---
-layout: default
-title: Home
----
 
 # 🍴 Welcome to My Food Blog
 
