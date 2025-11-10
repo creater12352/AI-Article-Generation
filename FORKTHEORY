@@ -1,0 +1,10 @@
+title: "ForkTheory"
+description: "Food reviewing using AI"
+url: "https://creater12352.github.io"
+baseurl: "/AI-Article-Generatoin"   # Leave blank ("") if it's your main user site
+theme: minima
+
+# Optional: make sure posts are found
+collections:
+  posts:
+    output: true
