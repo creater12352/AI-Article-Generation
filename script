@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""
+auto_passive_site.py
+Generates a static site (HTML + sitemap + RSS) and creates short MP4 videos
+for each article using offline TTS. Optionally publishes to GitHub if GH_TOKEN
+and GH_REPO environment variables are set.
+
+Run: python auto_passive_site.py
+"""
+
+import os
+import re
+import datetime
+import random
+import html
+import csv
+import subprocess
+import sys
+from pathlib import Path
+from io import BytesIO
+
+# ----------------- Config (no placeholders required) -----------------
+OUTPUT_DIR = Path("output_site")
+SITENAME = "TasteLoom"            # site brand name (change if you want)
+BASE_URL = "https://example.github.io/your-repo"  # used for sitemap/rss; optional
+AUTHOR = "Auto Generator"
+NUM_ARTICLES = 12                 # number of articles to create (adjust)
+WORDS_PER_ARTICLE = 650
+MAKE_VIDEOS = True                # set False if you don't want video generation
+VIDEO_DURATION_SECONDS = 30       # target length for each short clip
+VOX_RATE = 150                    # TTS speech rate (words per minute-ish)
+# --------------------------------------------------------------------
+
+# built-in keywords (long-tail seeds). You can drop in keywords.csv to override.
+DEFAULT_KEYWORDS = [
+    "easy one-pan dinners for busy weeknights",
+    "homemade sourdough starter for beginners",
+    "5-ingredient healthy breakfasts for work",
+    "budget-friendly vegan weeknight meals",
+    "how to meal prep for weight loss",
+    "best kitchen tools for small apartments",
+    "quick family-friendly pasta recipes",
+    "simple desserts without an oven",
+    "how to cook rice perfectly every time",
+    "low-carb dinner ideas under 30 minutes",
+    "simple sauces to upgrade any meal",
+    "top spices every home cook should own"
+]
+
+# ----------------- Dependencies check -----------------
+try:
+    import markdown
+    from PIL import Image, ImageDraw, ImageFont
+    import pyttsx3
+    from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips, CompositeVideoClip
+    import requests
+except Exception as e:
+    print("Missing packages. Create and install requirements.txt with:")
+    print("markdown, Pillow, pyttsx3, moviepy, requests")
+    print("Then run: pip install -r requirements.txt")
+    print("Detailed error:", e)
+    sys.exit(1)
+
+# ----------------- Helpers -----------------
+def slugify(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"\s+", "-", text.strip())
+    return text[:140]
+
+def load_keywords(n):
+    if Path("keywords.csv").exists():
+        with open("keywords.csv", newline='', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            keys = [row[0].strip() for row in reader if row and row[0].strip()]
+            if keys:
+                return keys[:n]
+    out = []
+    while len(out) < n:
+        base = random.choice(DEFAULT_KEYWORDS)
+        var = base + " " + random.choice(["guide", "tips", "2025", "for beginners"])
+        out.append(var)
+    return out[:n]
+
+def simple_generate_markdown(keyword, author, words):
+    title = keyword.title()
+    slug = slugify(keyword)
+    intro = f"Why {keyword} matters and what you'll learn in this guide.\n\n" \
+            f"People searching for \"{keyword}\" want fast, practical answers. This article gives clear steps, tips, and product suggestions when relevant.\n\n"
+    paras = []
+    # create a few paragraphs with the keyword repeated naturally
+    words_left = words - len(intro.split())
+    while words_left > 0:
+        chunk = (" ".join([keyword.split()[0].capitalize()] + ["tip"]*8) + 
+                 " — a quick practical suggestion: start with the basics and be consistent.")
+        paras.append(chunk)
+        words_left -= 40
+    product_block = (
+        f"### Quick recommendation\n\n"
+        f"If you're exploring options related to {keyword}, consider researching current prices and user reviews. Practical, affordable choices often provide the best value.\n\n"
+    )
+    cta = ("----\n"
+           "#### Want more?\n\n"
+           "Subscribe to the newsletter for monthly simple recipes and kitchen tips.\n\n")
+    md = f"# {title}\n\n*By {author} — {datetime.date.today().isoformat()}*\n\n"
+    md += intro + "\n\n".join(paras) + "\n\n" + product_block + "\n\n" + cta
+    return slug, title, md
+
+# ----------------- Site templates -----------------
+HTML_HEAD = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{title}</title>
+  <meta name="description" content="{description}">
+  <meta name="author" content="{author}">
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="alternate" type="application/rss+xml" title="{sitename} - RSS" href="/rss.xml">
+</head>
+<body>
+<header style="padding:20px;background:#fafafa;border-bottom:1px solid #eee;">
+  <div style="max-width:900px;margin:0 auto;">
+    <h1 style="margin:0;"><a href="/" style="text-decoration:none;color:inherit;">{sitename}</a></h1>
+  </div>
+</header>
+<main style="max-width:900px;margin:24px auto;padding:0 16px;">
+"""
+
+HTML_FOOT = """
+</main>
+<footer style="max-width:900px;margin:48px auto;padding:16px;color:#666;font-size:0.9rem;">
+  <div>© {year} {sitename} · Auto-generated</div>
+</footer>
+</body>
+</html>
+"""
+
+INDEX_TEMPLATE = HTML_HEAD + """
+<h2>Latest articles</h2>
+<ul>
+{items}
+</ul>
+""" + HTML_FOOT
+
+POST_TEMPLATE = HTML_HEAD + """
+<article>
+  <p style="color:#777;font-size:.95rem;">{meta}</p>
+  {content}
+</article>
+<hr>
+<p><a href="/">← Back to home</a></p>
+""" + HTML_FOOT
+
+STYLE_CSS = """
+body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; color:#111; line-height:1.6; }
+a { color: #1a73e8; }
+input[type="email"] { padding:8px; border:1px solid #ddd; border-radius:4px; }
+button { padding:8px 12px; border-radius:6px; border:0; background:#1a73e8; color:white; cursor:pointer; }
+"""
+
+# ----------------- Build functions -----------------
+def ensure_dirs():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / "posts").mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / "assets").mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / "videos").mkdir(parents=True, exist_ok=True)
+
+def build_site(posts_meta):
+    # index
+    items_html = ""
+    for p in posts_meta:
+        items_html += f'<li><a href="/posts/{p["filename"]}">{html.escape(p["title"])}</a> — <small>{p["date"]}</small></li>\n'
+    index_html = INDEX_TEMPLATE.format(title=f"{SITENAME} — Home",
+                                       description=f"{SITENAME} — helpful niche guides",
+                                       author=AUTHOR,
+                                       sitename=SITENAME,
+                                       items=items_html)
+    with open(OUTPUT_DIR / "index.html", "w", encoding="utf-8") as f:
+        f.write(index_html)
+
+    # posts already written to posts/
+    # sitemap
+    sitemap_items = f"<url><loc>{BASE_URL}/</loc><lastmod>{datetime.date.today().isoformat()}</lastmod></url>\n"
+    for p in posts_meta:
+        sitemap_items += f"<url><loc>{BASE_URL}/posts/{p['filename']}</loc><lastmod>{p['date']}</lastmod></url>\n"
+    sitemap = f'<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n{sitemap_items}</urlset>'
+    with open(OUTPUT_DIR / "sitemap.xml", "w", encoding="utf-8") as f:
+        f.write(sitemap)
+
+    # rss
+    rss_items = ""
+    for p in posts_meta:
+        rss_items += (
+            "<item>\n"
+            f"<title>{html.escape(p['title'])}</title>\n"
+            f"<link>{BASE_URL}/posts/{p['filename']}</link>\n"
+            f"<pubDate>{p['date']}</pubDate>\n"
+            f"<description>{html.escape(p['description'])}</description>\n"
+            "</item>\n"
+        )
+    rss = f'<?xml version="1.0" encoding="UTF-8" ?>\n<rss version="2.0">\n<channel>\n<title>{html.escape(SITENAME)}</title>\n<link>{BASE_URL}</link>\n<description>Automated feed</description>\n{rss_items}</channel>\n</rss>'
+    with open(OUTPUT_DIR / "rss.xml", "w", encoding="utf-8") as f:
+        f.write(rss)
+
+    # css
+    with open(OUTPUT_DIR / "assets" / "style.css", "w", encoding="utf-8") as f:
+        f.write(STYLE_CSS)
+
+def generate_articles():
+    ensure_dirs()
+    keywords = load_keywords(NUM_ARTICLES)
+    posts_meta = []
+    for kw in keywords:
+        slug, title, md = simple_generate_markdown(kw, AUTHOR, WORDS_PER_ARTICLE)
+        filename = f"{slug}.html"
+        html_content = markdown.markdown(md, extensions=['fenced_code', 'tables'])
+        meta = f"{AUTHOR} — {datetime.date.today().isoformat()}"
+        full = POST_TEMPLATE.format(title=html.escape(title),
+                                    description=html.escape(kw),
+                                    author=html.escape(AUTHOR),
+                                    sitename=SITENAME,
+                                    meta=meta,
+                                    content=html_content)
+        with open(OUTPUT_DIR / "posts" / filename, "w", encoding="utf-8") as f:
+            f.write(full)
+        posts_meta.append({
+            "title": title,
+            "slug": slug,
+            "filename": filename,
+            "description": kw,
+            "date": datetime.date.today().isoformat(),
+            "content_text": re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", html_content))[:1000]
+        })
+    build_site(posts_meta)
+    return posts_meta
+
+# ----------------- Video generation (offline) -----------------
+def text_to_speech_save(text, out_path):
+    engine = pyttsx3.init()
+    # Try to set rate
+    try:
+        engine.setProperty('rate', VOX_RATE)
+    except Exception:
+        pass
+    engine.save_to_file(text, str(out_path))
+    engine.runAndWait()
+
+def make_image_slide(text, size=(720,1280), fontsize=48, bg=(255,255,255)):
+    img = Image.new("RGB", size, color=bg)
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", fontsize)
+    except Exception:
+        font = ImageFont.load_default()
+    margin = 40
+    # Wrap text
+    lines = []
+    words = text.split()
+    line = ""
+    for w in words:
+        if len(line + " " + w) > 28:
+            lines.append(line.strip())
+            line = w
+        else:
+            line += " " + w
+    if line:
+        lines.append(line.strip())
+    y = margin
+    for ln in lines[:10]:
+        draw.text((margin, y), ln, fill=(20,20,20), font=font)
+        y += fontsize + 12
+    buf = BytesIO()
+    img.save(buf, format='PNG')
+    buf.seek(0)
+    return buf
+
+def create_video_for_post(post, out_video_path):
+    # Create short script from post content (first 80-120 words)
+    content_snippet = post['content_text']
+    words = content_snippet.split()
+    snippet = " ".join(words[:120])
+    if len(snippet.split()) < 20:
+        snippet = post['title'] + ". " + snippet
+    audio_path = out_video_path.with_suffix(".wav")
+    text_to_speech_save(snippet, audio_path)
+    # build a few image slides
+    slides = []
+    slide_texts = []
+    # split snippet into 3 parts
+    words = snippet.split()
+    chunk_size = max(40, len(words)//3)
+    for i in range(0, len(words), chunk_size):
+        slide_texts.append(" ".join(words[i:i+chunk_size]))
+    # ensure about 3 slides
+    slide_texts = slide_texts[:3] if len(slide_texts)>=3 else slide_texts + [snippet]
+    clips = []
+    audio_clip = AudioFileClip(str(audio_path)).subclip(0, min(VIDEO_DURATION_SECONDS, AudioFileClip(str(audio_path)).duration))
+    single_duration = max(3, min(VIDEO_DURATION_SECONDS/len(slide_texts), 10))
+    for txt in slide_texts:
+        img_buf = make_image_slide(txt)
+        clip = ImageClip(img_buf).set_duration(single_duration).resize(width=720)
+        clips.append(clip)
+    video = concatenate_videoclips(clips, method="compose")
+    # set audio
+    video = video.set_audio(audio_clip).set_duration(min(VIDEO_DURATION_SECONDS, audio_clip.duration))
+    # write file
+    video.write_videofile(str(out_video_path), fps=24, codec="libx264", audio_codec="aac", verbose=False, logger=None)
+    # cleanup audio file
+    try:
+        os.remove(str(audio_path))
+    except Exception:
+        pass
+
+# ----------------- GitHub publish (optional) -----------------
+def try_publish_to_github():
+    gh_token = os.environ.get("GH_TOKEN")
+    gh_repo = os.environ.get("GH_REPO")  # format: username/repo
+    if not gh_token or not gh_repo:
+        print("GH_TOKEN or GH_REPO not set — skipping GitHub publish.")
+        return False
+    # init git, commit, push to repo using token in URL (works if repo exists or token can create)
+    try:
+        cwd = OUTPUT_DIR.resolve()
+        def run(cmd):
+            subprocess.run(cmd, cwd=str(cwd), check=True)
+        run(["git", "init"])
+        run(["git", "add", "."])
+        run(["git", "commit", "-m", "Auto-generated site"])
+        # remote with token
+        owner_repo = gh_repo.strip()
+        # try to create repo via API (idempotent)
+        headers = {"Authorization": f"token {gh_token}"}
+        r = requests.get(f"https://api.github.com/repos/{owner_repo}", headers=headers)
+        if r.status_code == 404:
+            # create repo for authenticated user if owner matches username
+            parts = owner_repo.split("/")
+            if len(parts) == 2 and parts[0]:
+                # attempt to create under authenticated user
+                create_resp = requests.post("https://api.github.com/user/repos", headers=headers, json={"name": parts[1], "private": False})
+                if create_resp.status_code not in (200,201):
+                    print("Could not create repo via API; please create the repository manually or ensure permissions.")
+                    # still attempt push; may fail
+        remote_url = f"https://{gh_token}@github.com/{owner_repo}.git"
+        run(["git", "remote", "add", "origin", remote_url])
+        run(["git", "branch", "-M", "gh-pages"])
+        run(["git", "push", "-u", "origin", "gh-pages", "--force"])
+        print("Pushed site to GitHub gh-pages branch.")
+        return True
+    except Exception as e:
+        print("GitHub publish failed:", e)
+        return False
+
+# ----------------- Main -----------------
+def main():
+    print("Generating articles...")
+    posts = generate_articles()
+    print(f"Generated {len(posts)} posts in {OUTPUT_DIR / 'posts'}")
+
+    if MAKE_VIDEOS:
+        print("Generating videos (this may take a bit)...")
+        for p in posts:
+            safe_name = slugify(p['title'])
+            out_vid = OUTPUT_DIR / "videos" / f"{safe_name}.mp4"
+            try:
+                create_video_for_post(p, out_vid)
+                print("Created video:", out_vid)
+            except Exception as e:
+                print("Video creation failed for", p['title'], "error:", e)
+
+    # attempt publish if credentials available
+    published = try_publish_to_github()
+    if not published:
+        print("Site is ready locally in", OUTPUT_DIR.resolve())
+    print("Done. Open index.html in a browser to preview.")
+
+if __name__ == "__main__":
+    main()
+
